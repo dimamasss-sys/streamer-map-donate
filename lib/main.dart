@@ -58,6 +58,12 @@ Future<String> getLocationName(LatLng pos) async {
   }
 }
 
+String donorsWord(int n) {
+  if (n % 10 == 1 && n % 100 != 11) return 'донатер';
+  if (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) return 'донатера';
+  return 'донатеров';
+}
+
 String pointsWord(int n) {
   if (n % 10 == 1 && n % 100 != 11) return 'точка';
   if (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) return 'точки';
@@ -140,7 +146,8 @@ class LiveDonation {
   final int amount;
   final DateTime time;
   final String message;
-  LiveDonation({required this.donorName, required this.pointTitle, required this.amount, required this.time, this.message = ''});
+  final LatLng? position;
+  LiveDonation({required this.donorName, required this.pointTitle, required this.amount, required this.time, this.message = '', this.position});
 }
 
 final List<Streamer> allStreamers = [
@@ -555,56 +562,187 @@ class StreamerQRCodeScreen extends StatelessWidget {
 class LiveFeedScreen extends StatelessWidget {
   final Streamer streamer;
   const LiveFeedScreen({super.key, required this.streamer});
+
   @override
   Widget build(BuildContext context) {
     final feed = streamerFeed[streamer.name] ?? [];
+
+    // Группируем донаты по точкам
+    final Map<String, int> byPoint = {};
+    final Map<String, int> countByPoint = {};
+    for (final d in feed) {
+      byPoint[d.pointTitle] = (byPoint[d.pointTitle] ?? 0) + d.amount;
+      countByPoint[d.pointTitle] = (countByPoint[d.pointTitle] ?? 0) + 1;
+    }
+
+    // Сортируем по сумме (по убыванию)
+    final points = byPoint.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
     return Scaffold(
       backgroundColor: const Color(0xFFF0F2F5),
-      appBar: AppBar(backgroundColor: const Color(0xFF2AABEE), foregroundColor: Colors.white, elevation: 0,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF2AABEE),
+        foregroundColor: Colors.white,
+        elevation: 0,
         title: Row(children: [
-          Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)),
+          Container(width: 10, height: 10,
+            decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)),
           const SizedBox(width: 8),
-          const Text('LIVE — донаты', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 19)),
-        ])),
+          const Text('LIVE — донаты',
+            style: TextStyle(fontWeight: FontWeight.w600, fontSize: 19)),
+        ]),
+      ),
       body: feed.isEmpty
+        ? const Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(Icons.inbox, size: 60, color: Colors.grey),
+            SizedBox(height: 16),
+            Text('Пока нет донатов', style: TextStyle(fontSize: 16, color: Colors.grey)),
+          ]))
+        : ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: points.length,
+            itemBuilder: (ctx, i) {
+              final entry = points[i];
+              final title = entry.key;
+              final sum = entry.value;
+              final count = countByPoint[title] ?? 0;
+
+              // Ищем позицию точки для перелёта
+              final anyDonation = feed.firstWhere((d) => d.pointTitle == title);
+
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Material(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(14),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(14),
+                    onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PointDetailsScreen(streamer: streamer, pointTitle: title))),
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Row(children: [
+                        Container(
+                          width: 40, height: 40,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF2AABEE).withOpacity(0.1),
+                            shape: BoxShape.circle),
+                          child: const Icon(Icons.location_on, color: Color(0xFF2AABEE), size: 22),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(title,
+                              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
+                              overflow: TextOverflow.ellipsis),
+                            const SizedBox(height: 2),
+                            Text('$count ${donorsWord(count)}',
+                              style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          ]),
+                        ),
+                        Text('$sum ₽',
+                          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: Color(0xFF2AABEE))),
+                        const SizedBox(width: 2),
+                        const Icon(Icons.chevron_right, color: Colors.grey, size: 20),
+                      ]),
+                    ),
+                  ),
+                ),
+              );
+            }),
+    );
+  }
+}
+
+class PointDetailsScreen extends StatelessWidget {
+  final Streamer streamer;
+  final String pointTitle;
+  const PointDetailsScreen({super.key, required this.streamer, required this.pointTitle});
+
+  @override
+  Widget build(BuildContext context) {
+    final feed = streamerFeed[streamer.name] ?? [];
+    final donations = feed.where((d) => d.pointTitle == pointTitle).toList()
+      ..sort((a, b) => b.amount.compareTo(a.amount));
+    final total = donations.fold<int>(0, (s, x) => s + x.amount);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF0F2F5),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF2AABEE),
+        foregroundColor: Colors.white,
+        elevation: 0,
+        title: Text(pointTitle,
+          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18),
+          overflow: TextOverflow.ellipsis),
+      ),
+      body: Column(children: [
+        Container(
+          width: double.infinity,
+          margin: const EdgeInsets.all(12),
+          padding: const EdgeInsets.all(18),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 14, offset: const Offset(0, 4))]),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Всего собрано', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 2),
+            Row(children: [
+              Text('$total ₽',
+                style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w800, color: Colors.black87)),
+              const Spacer(),
+              Text('${donations.length} ${donorsWord(donations.length)}',
+                style: const TextStyle(fontSize: 13, color: Colors.grey)),
+            ]),
+          ])),
+        Expanded(child: donations.isEmpty
           ? const Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
               Icon(Icons.inbox, size: 60, color: Colors.grey),
               SizedBox(height: 16),
               Text('Пока нет донатов', style: TextStyle(fontSize: 16, color: Colors.grey)),
             ]))
           : ListView.builder(
-              padding: const EdgeInsets.all(12),
-              itemCount: feed.length,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              itemCount: donations.length,
               itemBuilder: (ctx, i) {
-                final d = feed[i];
-                return Padding(padding: const EdgeInsets.only(bottom: 8),
-                  child: Material(color: Colors.white, borderRadius: BorderRadius.circular(14),
-                    child: Padding(padding: const EdgeInsets.all(14), child: Row(children: [
-                      CircleAvatar(radius: 22, backgroundColor: const Color(0xFFE5875B),
-                        child: Text(d.donorName[0].toUpperCase(),
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
-                      const SizedBox(width: 12),
-                      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Row(children: [
-                          Text(d.donorName, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
-                          const SizedBox(width: 6),
-                          Container(padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                            decoration: BoxDecoration(color: const Color(0xFF2AABEE).withOpacity(0.15), borderRadius: BorderRadius.circular(4)),
-                            child: Text('→ ${d.pointTitle}', style: const TextStyle(fontSize: 11, color: Color(0xFF2AABEE), fontWeight: FontWeight.w600))),
-                        ]),
-                        if (d.message.isNotEmpty) ...[
-                          const SizedBox(height: 4),
-                          Text(d.message, style: const TextStyle(fontSize: 13, color: Colors.black87, fontStyle: FontStyle.italic)),
-                        ],
-                        const SizedBox(height: 2),
-                        Text(_ago(d.time), style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                      ])),
-                      Text('+${d.amount} ₽',
-                        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900, color: Color(0xFF2AABEE))),
-                    ]))));
-              }),
+                final d = donations[i];
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Material(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(14),
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        CircleAvatar(radius: 22, backgroundColor: const Color(0xFFE5875B),
+                          child: Text(d.donorName[0].toUpperCase(),
+                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16))),
+                        const SizedBox(width: 12),
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(d.donorName,
+                            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15)),
+                          if (d.message.isNotEmpty) ...[
+                            const SizedBox(height: 4),
+                            Text(d.message,
+                              style: const TextStyle(fontSize: 13, color: Colors.black87, fontStyle: FontStyle.italic)),
+                          ],
+                          const SizedBox(height: 2),
+                          Text(_ago(d.time),
+                            style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                        ])),
+                        Text('+${d.amount} ₽',
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: Color(0xFF2AABEE))),
+                      ]),
+                    ),
+                  ),
+                );
+              })),
+      ]),
     );
   }
+
   String _ago(DateTime t) {
     final d = DateTime.now().difference(t);
     if (d.inSeconds < 60) return 'только что';
@@ -630,7 +768,7 @@ class _DashState extends State<StreamerDashboardScreen> {
   Timer? _miningTimer;
   Timer? _spoilTimer;
   int _earnedNow = 0;
-  int _spoiledIdx = 0;
+  int _browseIdx = 0;
   final MapController _mapCtrl = MapController();
 
   List<DonationPoint> get points {
@@ -839,34 +977,65 @@ class _DashState extends State<StreamerDashboardScreen> {
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
                 child: const Text('Вывести', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12.5))),
             ]),
-            if (spoiledTotal > 0) ...[
-              const SizedBox(height: 9),
-              GestureDetector(
-                onTap: () {
-                  final spoiled = points.where((p) => p.isSpoiled).toList();
-                  if (spoiled.isEmpty) return;
-                  if (_spoiledIdx >= spoiled.length) _spoiledIdx = 0;
-                  final target = spoiled[_spoiledIdx];
-                  _mapCtrl.move(target.position, 16);
-                  setState(() => _selectedPoint = target);
-                  _snack('Горящий донат ${_spoiledIdx + 1} из ${spoiled.length}: ${target.title}', Colors.red);
-                  _spoiledIdx++;
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                  decoration: BoxDecoration(color: Colors.red.withOpacity(0.08), borderRadius: BorderRadius.circular(12)),
-                  child: Row(children: [
-                    const Icon(Icons.local_fire_department, color: Color(0xFFD32F2F), size: 22),
-                    const SizedBox(width: 8),
-                    Expanded(child: Text(_spoiledText(spoiledTotal),
-                      style: const TextStyle(color: Colors.red, fontWeight: FontWeight.w600, fontSize: 12.5))),
-                    const Icon(Icons.touch_app, color: Colors.black54, size: 14),
-                    const SizedBox(width: 4),
-                    const Text('показать', style: TextStyle(color: Colors.black54, fontSize: 11.5, fontWeight: FontWeight.w500)),
-                  ]),
+              if (points.isNotEmpty) ...[
+                const SizedBox(height: 9),
+                GestureDetector(
+                  onTap: () {
+                    final hot = points.where((p) => p.isSpoiled).toList()
+                      ..sort((a, b) => b.totalAmount.compareTo(a.totalAmount));
+                    final warm = points.where((p) => !p.isSpoiled).toList()
+                      ..sort((a, b) => b.totalAmount.compareTo(a.totalAmount));
+                    final order = [...hot, ...warm];
+                    if (order.isEmpty) return;
+                    // Если панель закрыта — начинаем сначала
+                    if (_selectedPoint == null) _browseIdx = 0;
+                    if (_browseIdx >= order.length) _browseIdx = 0;
+                    final target = order[_browseIdx];
+                    _mapCtrl.move(target.position, 16);
+                    setState(() => _selectedPoint = target);
+                    _browseIdx++;
+                  },
+                  child: Builder(builder: (ctx) {
+                    final selected = _selectedPoint;
+                    final Color color;
+                    final IconData icon;
+                    final String text;
+                    if (selected != null) {
+                      color = selected.isSpoiled ? Colors.red : const Color(0xFFB8860B);
+                      icon = selected.isSpoiled ? Icons.local_fire_department : Icons.location_on;
+                      text = selected.title;
+                    } else if (spoiledTotal > 0) {
+                      color = Colors.red;
+                      icon = Icons.local_fire_department;
+                      text = _spoiledText(spoiledTotal);
+                    } else {
+                      color = const Color(0xFF2AABEE);
+                      icon = Icons.location_on;
+                      text = '${points.length} ${pointsWord(points.length)}';
+                    }
+                    return Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: color.withOpacity(0.08),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: color.withOpacity(0.25), width: 1),
+                      ),
+                      child: Row(children: [
+                        Icon(icon, color: color, size: 18),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(text,
+                          style: TextStyle(color: color, fontWeight: FontWeight.w600, fontSize: 12.5),
+                          overflow: TextOverflow.ellipsis)),
+                        const Icon(Icons.touch_app, color: Colors.black54, size: 14),
+                        const SizedBox(width: 4),
+                        const Text('следующая точка',
+                          style: TextStyle(color: Colors.black54,
+                            fontSize: 11.5, fontWeight: FontWeight.w500)),
+                      ]),
+                    );
+                  }),
                 ),
-              ),
-            ],
+              ],
           ])))),
         if (_miningPoint != null && _isShiftActive)
           Positioned(left: 20, right: 20, bottom: _selectedPoint != null ? 340 : 110,
@@ -969,63 +1138,55 @@ class _DashState extends State<StreamerDashboardScreen> {
 
   Widget _infoPanel(DonationPoint p) {
     final tts = p.timeToSpoil;
+    final spoiled = p.isSpoiled;
+    final mainColor = spoiled ? Colors.red : const Color(0xFFB8860B);
+
     return Container(
       decoration: const BoxDecoration(color: Colors.white,
-        borderRadius: BorderRadius.only(topLeft: Radius.circular(24), topRight: Radius.circular(24))),
-      padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
+        borderRadius: BorderRadius.only(topLeft: Radius.circular(18), topRight: Radius.circular(18))),
+      padding: const EdgeInsets.fromLTRB(16, 5, 16, 8),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Center(child: Container(width: 36, height: 4,
-          decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2)))),
-        const SizedBox(height: 6),
-        Row(children: [
-          Expanded(child: Text(p.title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold))),
-          IconButton(
-            icon: const Icon(Icons.close, color: Colors.grey, size: 20),
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
-            onPressed: () => setState(() => _selectedPoint = null)),
-        ]),
-        Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            gradient: LinearGradient(colors: p.isSpoiled
-              ? [Colors.red.withOpacity(0.15), Colors.red.withOpacity(0.05)]
-              : [const Color(0xFFFFD700).withOpacity(0.15), const Color(0xFFFFD700).withOpacity(0.05)]),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: p.isSpoiled ? Colors.red.withOpacity(0.4) : const Color(0xFFFFD700).withOpacity(0.4))),
-          child: Row(children: [
-            p.isSpoiled
-              ? const Icon(Icons.local_fire_department, color: Color(0xFFD32F2F), size: 30)
-              : const Icon(Icons.monetization_on, color: Color(0xFFB8860B), size: 28),
-            const SizedBox(width: 10),
-            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              if (!p.isSpoiled)
-                const Text('Собрано', style: TextStyle(fontSize: 10.5, color: Colors.grey)),
-              Text('${p.totalAmount} ₽', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900,
-                color: p.isSpoiled ? Colors.red : const Color(0xFFB8860B))),
-              const SizedBox(height: 2),
-              Text(
-                p.isSpoiled
-                  ? '−$kSpoilRate ₽/сек · беги!'
-                  : 'ещё ${_fmtDur(tts)}',
-                style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600,
-                  color: p.isSpoiled ? Colors.red : const Color(0xFF2AABEE))),
-            ])),
-            const Spacer(),
-            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-              const Text('Донатеров', style: TextStyle(fontSize: 10.5, color: Colors.grey)),
-              Text('${p.donors.length}', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-            ]),
-          ])),
 
-        const SizedBox(height: 8),
-        if (_myPos != null) Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-          decoration: BoxDecoration(color: const Color(0xFF2AABEE).withOpacity(0.08), borderRadius: BorderRadius.circular(10)),
+        Row(children: [
+          Expanded(child: Text(p.title,
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold))),
+          GestureDetector(
+            onTap: () => setState(() => _selectedPoint = null),
+            child: const Padding(
+              padding: EdgeInsets.all(2),
+              child: Icon(Icons.close, color: Colors.grey, size: 18))),
+        ]),
+        const SizedBox(height: 4),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: mainColor.withOpacity(0.08),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: mainColor.withOpacity(0.3), width: 1)),
           child: Row(children: [
-            const Icon(Icons.near_me, color: Color(0xFF2AABEE), size: 16),
+            Icon(spoiled ? Icons.local_fire_department : Icons.monetization_on,
+              color: mainColor, size: 18),
             const SizedBox(width: 6),
-            Text('До точки: ${_dist(p).toStringAsFixed(0)} м',
-              style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: Color(0xFF2AABEE))),
+            if (spoiled)
+              Text('сгорает · ',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700,
+                  color: Colors.red.withOpacity(0.85))),
+            Expanded(child: Row(children: [
+              Text('${p.totalAmount} ₽',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900, color: mainColor)),
+              const SizedBox(width: 8),
+              Flexible(child: Text(
+                spoiled ? '· −$kSpoilRate ₽/сек' : '· ждёт ${_fmtDur(tts)}',
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600,
+                  color: spoiled ? Colors.red : const Color(0xFF2AABEE)),
+                overflow: TextOverflow.ellipsis)),
+            ])),
+            Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+              Text('${p.donors.length}',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: mainColor)),
+              Text(donorsWord(p.donors.length),
+                style: TextStyle(fontSize: 8.5, color: mainColor.withOpacity(0.75))),
+            ]),
           ])),
       ]),
     );
@@ -1055,7 +1216,7 @@ class _DashState extends State<StreamerDashboardScreen> {
     late OverlayEntry entry;
     entry = OverlayEntry(
       builder: (ctx) => Positioned(
-                bottom: _selectedPoint != null ? 380 : 120, left: 30, right: 30,
+                top: MediaQuery.of(ctx).padding.top + 210, left: 30, right: 30,
         child: Material(
           color: Colors.transparent,
           child: Center(
@@ -1534,7 +1695,7 @@ class _DonState extends State<DonaterMapScreen> {
       p.donors.add('Вы');
       streamerFeed.putIfAbsent(widget.streamer.name, () => []);
       streamerFeed[widget.streamer.name]!.insert(0,
-        LiveDonation(donorName: 'Вы', pointTitle: p.title, amount: a, time: DateTime.now(), message: filterBadWords(_msg.text.trim())));
+        LiveDonation(donorName: 'Вы', pointTitle: p.title, amount: a, time: DateTime.now(), message: filterBadWords(_msg.text.trim()), position: p.position));
       _sel = null;
       _amount.clear();
       _msg.clear();
@@ -1566,7 +1727,7 @@ class _DonState extends State<DonaterMapScreen> {
       ));
       streamerFeed.putIfAbsent(widget.streamer.name, () => []);
       streamerFeed[widget.streamer.name]!.insert(0,
-        LiveDonation(donorName: 'Вы', pointTitle: name, amount: kCreateCost, time: DateTime.now(), message: 'Создал новый донат'));
+        LiveDonation(donorName: 'Вы', pointTitle: name, amount: kCreateCost, time: DateTime.now(), message: 'Создал новый донат', position: pos));
       _placing = false;
     });
     _snack('Донат «$name» создан · −$kCreateCost ₽', const Color(0xFF2AABEE));
