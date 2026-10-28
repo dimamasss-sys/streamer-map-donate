@@ -200,6 +200,52 @@ void main() async {
   runApp(StreamerMapApp(initialStreamerName: params['streamer']));
 }
 
+
+
+
+Future<void> updatePointInCloud(DonationPoint p) async {
+  if (p.id == null) return;
+  try {
+    await FirebaseFirestore.instance.collection('points').doc(p.id).update({
+      'totalAmount': p.totalAmount,
+      'lastTopUp': p.lastTopUp.toIso8601String(),
+      'donors': p.donors,
+    });
+  } catch (e) {
+    print('Ошибка обновления точки: $e');
+  }
+}
+
+
+Future<void> updatePointInCloudSafe(DonationPoint p, String streamerName, int amountChange, DateTime topUpTime, String? donor) async {
+  try {
+    if (p.id != null) {
+      await FirebaseFirestore.instance.collection('points').doc(p.id).update({
+        'totalAmount': FieldValue.increment(amountChange),
+        'lastTopUp': topUpTime.toIso8601String(),
+        if (donor != null) 'donors': FieldValue.arrayUnion([donor])
+      });
+    } else {
+      // Если ID нет (гонка при создании), ищем точку по названию
+      final snapshot = await FirebaseFirestore.instance.collection('points')
+        .where('streamerName', isEqualTo: streamerName)
+        .where('title', isEqualTo: p.title)
+        .get();
+      if (snapshot.docs.isNotEmpty) {
+        final docId = snapshot.docs.first.id;
+        p.id = docId;
+        await FirebaseFirestore.instance.collection('points').doc(docId).update({
+          'totalAmount': FieldValue.increment(amountChange),
+          'lastTopUp': topUpTime.toIso8601String(),
+          if (donor != null) 'donors': FieldValue.arrayUnion([donor])
+        });
+      }
+    }
+  } catch (e) {
+    print('Ошибка обновления точки в облаке: $e');
+  }
+}
+
 class StreamerMapApp extends StatelessWidget {
   final String? initialStreamerName;
   const StreamerMapApp({super.key, this.initialStreamerName});
@@ -360,16 +406,32 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
   void initState() { super.initState(); _subs = getRealtimeListeners(widget.streamer.name, () { if (mounted) setState(() {}); }); }
   @override
   void dispose() { for (var sub in _subs) { sub.cancel(); } super.dispose(); }
+
   @override
   Widget build(BuildContext context) {
     final feed = streamerFeed[widget.streamer.name] ?? [];
+    final activePoints = streamerPoints[widget.streamer.name] ?? []; // Точки, которые сейчас на карте
     final Map<String, List<LiveDonation>> byPoint = {};
-    for (final d in feed) { byPoint.putIfAbsent(d.pointTitle, () => []).add(d); }
-    final points = byPoint.entries.toList()..sort((a, b) { final sumA = a.value.fold<int>(0, (s, x) => s + x.amount); final sumB = b.value.fold<int>(0, (s, x) => s + x.amount); return sumB.compareTo(sumA); });
+    
+    for (final d in feed) { 
+      byPoint.putIfAbsent(d.pointTitle, () => []).add(d); 
+    }
+    
+    // Сортируем по реальной сумме на карте (или исторической, если точки нет)
+    final points = byPoint.entries.toList()..sort((a, b) {
+      final pA = activePoints.where((p) => p.title == a.key).firstOrNull;
+      final pB = activePoints.where((p) => p.title == b.key).firstOrNull;
+      final sumA = pA?.currentAmount ?? a.value.fold<int>(0, (s, x) => s + x.amount);
+      final sumB = pB?.currentAmount ?? b.value.fold<int>(0, (s, x) => s + x.amount);
+      return sumB.compareTo(sumA); 
+    });
     
     return Scaffold(
       backgroundColor: const Color(0xFFF0F2F5),
-      appBar: AppBar(backgroundColor: const Color(0xFF2AABEE), foregroundColor: Colors.white, elevation: 0, title: Row(children: [Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)), const SizedBox(width: 8), const Text('LIVE — донаты', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 19))])),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF2AABEE), foregroundColor: Colors.white, elevation: 0, 
+        title: Row(children: [Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)), const SizedBox(width: 8), const Text('LIVE — донаты', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 19))])
+      ),
       body: feed.isEmpty 
         ? const Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(Icons.inbox, size: 60, color: Colors.grey), SizedBox(height: 16), Text('Пока нет донатов', style: TextStyle(fontSize: 16, color: Colors.grey))])) 
         : ListView.builder(
@@ -378,7 +440,12 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
             itemBuilder: (ctx, i) {
               final title = points[i].key; 
               final donations = points[i].value; 
-              final sum = donations.fold<int>(0, (s, x) => s + x.amount);
+              final activePoint = activePoints.where((p) => p.title == title).firstOrNull;
+              
+              // Если точка активна — берем её текущую сумму, если нет — сумму донатов
+              final sum = activePoint?.currentAmount ?? donations.fold<int>(0, (s, x) => s + x.amount);
+              final isActive = activePoint != null;
+
               return Padding(
                 padding: const EdgeInsets.only(bottom: 8), 
                 child: Material(
@@ -389,16 +456,20 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
                     onTap: () async {
                       final result = await Navigator.push(context, MaterialPageRoute(builder: (_) => PointDetailsScreen(streamer: widget.streamer, pointTitle: title)));
                       if (result != null && mounted) {
-                        Navigator.pop(context, result); // Возвращаем координаты на карту
+                        Navigator.pop(context, result);
                       }
                     },
                     child: Padding(
                       padding: const EdgeInsets.all(14), 
                       child: Row(children: [
-                        Container(width: 40, height: 40, decoration: BoxDecoration(color: const Color(0xFF2AABEE).withOpacity(0.1), shape: BoxShape.circle), child: const Icon(Icons.location_on, color: Color(0xFF2AABEE), size: 22)), 
+                        Container(width: 40, height: 40, decoration: BoxDecoration(color: isActive ? const Color(0xFF2AABEE).withOpacity(0.1) : Colors.grey.withOpacity(0.1), shape: BoxShape.circle), child: Icon(isActive ? Icons.location_on : Icons.check_circle, color: isActive ? const Color(0xFF2AABEE) : Colors.grey, size: 22)), 
                         const SizedBox(width: 12),
-                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15), overflow: TextOverflow.ellipsis), const SizedBox(height: 2), Text('${donations.length} ${donorsWord(donations.length)}', style: const TextStyle(fontSize: 12, color: Colors.grey))])),
-                        Text('$sum ₽', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: Color(0xFF2AABEE))), 
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(title, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15, color: isActive ? Colors.black87 : Colors.grey), overflow: TextOverflow.ellipsis), 
+                          const SizedBox(height: 2), 
+                          Text(isActive ? '${donations.length} ${donorsWord(donations.length)}' : 'Пройдено · ${donations.length} ${donorsWord(donations.length)}', style: TextStyle(fontSize: 12, color: isActive ? Colors.grey : Colors.grey.shade500))
+                        ])),
+                        Text('$sum ₽', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: isActive ? const Color(0xFF2AABEE) : Colors.grey)), 
                         const SizedBox(width: 2), 
                         const Icon(Icons.chevron_right, color: Colors.grey, size: 20),
                       ]),
@@ -412,14 +483,6 @@ class _LiveFeedScreenState extends State<LiveFeedScreen> {
   }
 }
 
-class PointDetailsScreen extends StatefulWidget {
-  final Streamer streamer;
-  final String pointTitle;
-  const PointDetailsScreen({super.key, required this.streamer, required this.pointTitle});
-  @override
-  State<PointDetailsScreen> createState() => _PointDetailsScreenState();
-}
-
 class _PointDetailsScreenState extends State<PointDetailsScreen> {
   List<StreamSubscription> _subs = [];
   @override
@@ -429,12 +492,33 @@ class _PointDetailsScreenState extends State<PointDetailsScreen> {
   @override
   Widget build(BuildContext context) {
     final feed = streamerFeed[widget.streamer.name] ?? [];
+    final activePoints = streamerPoints[widget.streamer.name] ?? [];
+    final activePoint = activePoints.where((p) => p.title == widget.pointTitle).firstOrNull;
+    
     final donations = feed.where((d) => d.pointTitle == widget.pointTitle).toList()..sort((a, b) => b.amount.compareTo(a.amount));
-    final total = donations.fold<int>(0, (s, x) => s + x.amount);
+    
+    // Если точка есть на карте — берем её текущий баланс, иначе сумму истории
+    final total = activePoint != null ? activePoint.currentAmount : donations.fold<int>(0, (s, x) => s + x.amount);
     return Scaffold(backgroundColor: const Color(0xFFF0F2F5), appBar: AppBar(backgroundColor: const Color(0xFF2AABEE), foregroundColor: Colors.white, elevation: 0, title: Text(widget.pointTitle, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18), overflow: TextOverflow.ellipsis)),
       body: Column(children: [
-        Container(width: double.infinity, margin: const EdgeInsets.all(12), padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 3))]),
-          child: Row(children: [const Icon(Icons.savings, color: Color(0xFF2AABEE), size: 22), const SizedBox(width: 10), Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Всего собрано', style: TextStyle(fontSize: 11, color: Colors.grey)), Text('$total ₽', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: Colors.black87))]), const Spacer(), Text('${donations.length} ${donorsWord(donations.length)}', style: const TextStyle(fontSize: 12, color: Colors.grey))])),
+        GestureDetector(
+          onTap: () {
+            final points = streamerPoints[widget.streamer.name] ?? [];
+            final point = points.where((p) => p.title == widget.pointTitle).firstOrNull;
+            if (point != null) {
+              Navigator.pop(context, point.title);
+            } else {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                content: Text('Точка уже пройдена', style: TextStyle(color: Colors.white)), 
+                backgroundColor: Colors.red,
+                behavior: SnackBarBehavior.floating,
+              ));
+            }
+          },
+          child: Container(width: double.infinity, margin: const EdgeInsets.all(12), padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 3))]),
+            child: Row(children: [const Icon(Icons.savings, color: Color(0xFF2AABEE), size: 22), const SizedBox(width: 10), Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(activePoint != null ? 'Осталось на точке (онлайн)' : 'Всего собрано', style: const TextStyle(fontSize: 11, color: Colors.grey)), Text('$total ₽', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: Colors.black87))]), const Spacer(), Text('${donations.length} ${donorsWord(donations.length)}', style: const TextStyle(fontSize: 12, color: Colors.grey))])),
+        ),
         Expanded(child: donations.isEmpty ? const Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(Icons.chat_bubble_outline, size: 60, color: Colors.grey), SizedBox(height: 16), Text('Пока нет донатов', style: TextStyle(fontSize: 16, color: Colors.grey))])) : ListView.builder(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4), itemCount: donations.length, itemBuilder: (ctx, i) {
           final d = donations[i];
           return Padding(padding: const EdgeInsets.symmetric(vertical: 5), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -446,6 +530,15 @@ class _PointDetailsScreenState extends State<PointDetailsScreen> {
     );
   }
   String _ago(DateTime t) { final d = DateTime.now().difference(t); if (d.inSeconds < 60) return 'только что'; if (d.inMinutes < 60) return '${d.inMinutes} мин назад'; if (d.inHours < 24) return '${d.inHours} ч назад'; return '${d.inDays} дн назад'; }
+}
+
+
+class PointDetailsScreen extends StatefulWidget {
+  final Streamer streamer;
+  final String pointTitle;
+  const PointDetailsScreen({super.key, required this.streamer, required this.pointTitle});
+  @override
+  State<PointDetailsScreen> createState() => _PointDetailsScreenState();
 }
 
 class StreamerDashboardScreen extends StatefulWidget {
@@ -558,7 +651,12 @@ class _DashState extends State<StreamerDashboardScreen> {
             userAgentPackageName: 'ru.dimamasss.streamermapdonate',
             evictErrorTileStrategy: EvictErrorTileStrategy.dispose,
           ),
-          MarkerLayer(markers: points.map((p) => Marker(point: p.position, width: 120, height: 140, child: GestureDetector(onTap: () => setState(() => _selectedPoint = p), child: _goldCoin(p)))).toList()),
+          MarkerLayer(markers: points.map((p) => Marker(point: p.position, width: 120, height: 140, child: GestureDetector(
+                onTap: () {
+                  _mapCtrl.move(p.position, 16);
+                  setState(() => _selectedPoint = p);
+                },
+                child: _goldCoin(p)))).toList()),
           if (_myPos != null) MarkerLayer(markers: [Marker(point: LatLng(_myPos!.latitude, _myPos!.longitude), width: 40, height: 40, child: Container(decoration: BoxDecoration(color: const Color(0xFF2AABEE), shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 3), boxShadow: [BoxShadow(color: const Color(0xFF2AABEE).withOpacity(0.6), blurRadius: 12, spreadRadius: 4)])))]),
         ],
       ),
@@ -569,7 +667,17 @@ class _DashState extends State<StreamerDashboardScreen> {
           Row(children: [
             _circleBtn(Icons.arrow_back, () => Navigator.pop(context)), const SizedBox(width: 8),
             Expanded(child: Row(children: [CircleAvatar(radius: 18, backgroundColor: const Color(0xFF2AABEE), child: Text(widget.streamer.name[0].toUpperCase(), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16))), const SizedBox(width: 8), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(widget.streamer.name, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14, color: Colors.black87), overflow: TextOverflow.ellipsis), Text('стример', style: TextStyle(fontSize: 11, color: Colors.grey.shade500))]))])),
-            GestureDetector(onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => LiveFeedScreen(streamer: widget.streamer))), child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), decoration: BoxDecoration(color: Colors.red.withOpacity(0.1), borderRadius: BorderRadius.circular(20)), child: Row(children: [Container(width: 8, height: 8, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)), const SizedBox(width: 6), const Text('LIVE', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 11))]))),
+            GestureDetector(
+              onTap: () async {
+                final result = await Navigator.push(context, MaterialPageRoute(builder: (_) => LiveFeedScreen(streamer: widget.streamer)));
+                if (result != null && result is String && mounted) {
+                  final target = points.where((p) => p.title == result).firstOrNull;
+                  if (target != null) {
+                    _mapCtrl.move(target.position, 16);
+                    setState(() => _selectedPoint = target);
+                  }
+                }
+              }, child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8), decoration: BoxDecoration(color: Colors.red.withOpacity(0.1), borderRadius: BorderRadius.circular(20)), child: Row(children: [Container(width: 8, height: 8, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)), const SizedBox(width: 6), const Text('LIVE', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 11))]))),
             const SizedBox(width: 6), _circleBtn(Icons.history, () => Navigator.push(context, MaterialPageRoute(builder: (_) => EarningsHistoryScreen(streamer: widget.streamer))).then((_) => setState(() {}))),
           ]),
           const SizedBox(height: 10), Container(height: 1, color: Colors.grey.shade200), const SizedBox(height: 10),
@@ -593,6 +701,22 @@ class _DashState extends State<StreamerDashboardScreen> {
       ))),
       if (_miningPoint != null && _isShiftActive) Positioned(left: 20, right: 20, bottom: _selectedPoint != null ? 340 : 110, child: Container(padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 20)]),
         child: Row(children: [Container(width: 44, height: 44, decoration: const BoxDecoration(shape: BoxShape.circle, gradient: RadialGradient(colors: [Color(0xFFFFF3A0), Color(0xFFFFD700), Color(0xFFB8860B)], stops: [0, 0.6, 1])), child: const Icon(Icons.attach_money, color: Color(0xFF4A3200))), const SizedBox(width: 12), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(_miningPoint!.title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15)), Text('+$kBurnRate ₽/сек · осталось ${_miningPoint!.currentAmount} ₽', style: const TextStyle(color: Colors.white70, fontSize: 12))])), const Icon(Icons.bolt, color: Color(0xFFFFD700), size: 28)]))),
+      // Кнопка возврата к своей геолокации
+      if (_myPos != null)
+        Positioned(
+          right: 20,
+          bottom: _selectedPoint != null ? 320 : (_miningPoint != null && _isShiftActive ? 100 : 90),
+          child: FloatingActionButton(
+            mini: true,
+            backgroundColor: Colors.white,
+            elevation: 4,
+            onPressed: () {
+              _mapCtrl.move(LatLng(_myPos!.latitude, _myPos!.longitude), 16);
+            },
+            child: const Icon(Icons.my_location, color: Color(0xFF2AABEE)),
+          ),
+        ),
+      
       Positioned(left: 20, right: 20, bottom: _selectedPoint != null ? 20 : 30, child: ElevatedButton.icon(onPressed: _toggleShift, icon: Icon(_isShiftActive ? Icons.stop_circle : Icons.play_circle_filled), label: Text(_isShiftActive ? 'Остановить квест' : 'Начать квест', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)), style: ElevatedButton.styleFrom(backgroundColor: _isShiftActive ? Colors.red.shade400 : const Color(0xFF2AABEE), foregroundColor: Colors.white, elevation: 6, padding: const EdgeInsets.symmetric(vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))))),
       if (_selectedPoint != null) Positioned(left: 0, right: 0, bottom: 0, child: _infoPanel(_selectedPoint!)),
     ]));
@@ -710,7 +834,7 @@ class DonaterMapScreen extends StatefulWidget {
 }
 
 class _DonState extends State<DonaterMapScreen> {
-  bool _placing = false; DonationPoint? _sel; final _amount = TextEditingController(); final _msg = TextEditingController(); final _nameController = TextEditingController();
+  bool _placing = false; DonationPoint? _sel; final MapController _mapCtrl = MapController(); final _amount = TextEditingController(); final _msg = TextEditingController(); final _nameController = TextEditingController();
   Timer? _spoilTimer; bool _isCreating = false; List<StreamSubscription> _fbSubs = [];
   List<DonationPoint> get points { streamerPoints.putIfAbsent(widget.streamer.name, () => []); return streamerPoints[widget.streamer.name]!; }
 
@@ -730,7 +854,7 @@ class _DonState extends State<DonaterMapScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(body: Stack(children: [
-      FlutterMap(options: MapOptions(
+      FlutterMap(mapController: _mapCtrl, options: MapOptions(
         initialCenter: const LatLng(56.0184, 92.8672), initialZoom: 13, minZoom: 4.0, maxZoom: 19.0,
         onTap: (pos, latlng) { if (_placing) { _newPointDialog(latlng); } else { setState(() { _sel = null; _isCreating = false; }); } }),
         children: [
@@ -740,7 +864,12 @@ class _DonState extends State<DonaterMapScreen> {
             userAgentPackageName: 'ru.dimamasss.streamermapdonate',
             evictErrorTileStrategy: EvictErrorTileStrategy.dispose,
           ),
-          MarkerLayer(markers: points.map((p) => Marker(point: p.position, width: 100, height: 110, child: GestureDetector(onTap: _placing ? null : () => setState(() { _sel = p; _amount.clear(); }), child: _goldCoin(p)))).toList()),
+          MarkerLayer(markers: points.map((p) => Marker(point: p.position, width: 100, height: 110, child: GestureDetector(
+              onTap: _placing ? null : () {
+                _mapCtrl.move(p.position, 16);
+                setState(() { _sel = p; _amount.clear(); });
+              },
+              child: _goldCoin(p)))).toList()),
         ],
       ),
       SafeArea(child: Padding(padding: const EdgeInsets.all(12), child: Row(children: [
@@ -748,7 +877,17 @@ class _DonState extends State<DonaterMapScreen> {
         const SizedBox(width: 10),
         Expanded(child: Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(30), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 10)]), child: Row(children: [CircleAvatar(radius: 18, backgroundColor: const Color(0xFF2AABEE), child: Text(widget.streamer.name[0].toUpperCase(), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16))), const SizedBox(width: 10), Expanded(child: Text(widget.streamer.name, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14), overflow: TextOverflow.ellipsis))]))),
         const SizedBox(width: 8),
-        GestureDetector(onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => LiveFeedScreen(streamer: widget.streamer))), child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(30), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 10)]), child: Row(children: [Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)), const SizedBox(width: 6), const Text('LIVE', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 12))]))),
+        GestureDetector(
+          onTap: () async {
+            final result = await Navigator.push(context, MaterialPageRoute(builder: (_) => LiveFeedScreen(streamer: widget.streamer)));
+            if (result != null && result is String && mounted) {
+              final target = points.where((p) => p.title == result).firstOrNull;
+              if (target != null) {
+                _mapCtrl.move(target.position, 16);
+                setState(() { _sel = target; _amount.clear(); });
+              }
+            }
+          }, child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(30), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 10)]), child: Row(children: [Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)), const SizedBox(width: 6), const Text('LIVE', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 12))]))),
       ]))),
       if (_placing) Positioned(top: 100, left: 20, right: 20, child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12), decoration: BoxDecoration(color: Colors.orange, borderRadius: BorderRadius.circular(14)), child: const Row(children: [Icon(Icons.touch_app, color: Colors.white, size: 18), SizedBox(width: 8), Expanded(child: Text('Тапните по карте, чтобы поставить точку', style: TextStyle(color: Colors.white, fontSize: 13)))]))),
       if (_sel == null && !_placing) Positioned(bottom: 30, right: 20, child: FloatingActionButton.extended(onPressed: () => setState(() => _placing = true), backgroundColor: const Color(0xFF2AABEE), foregroundColor: Colors.white, icon: const Icon(Icons.add_location_alt), label: const Text('Создать точку'))),
@@ -760,41 +899,208 @@ class _DonState extends State<DonaterMapScreen> {
   String _fmt(int a) { if (a >= 1000) { final v = a / 1000; return v == v.roundToDouble() ? '${v.toInt()}к' : '${v.toStringAsFixed(1)}к'; } return '$a'; }
 
   Widget _donateSheet(DonationPoint p) {
-    return Container(decoration: const BoxDecoration(color: Colors.white, borderRadius: BorderRadius.only(topLeft: Radius.circular(18), topRight: Radius.circular(18))), padding: const EdgeInsets.fromLTRB(14, 6, 14, 10),
-      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Center(child: Container(width: 32, height: 3, decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2)))), const SizedBox(height: 4),
-        Row(children: [Expanded(child: Text(p.title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis)), GestureDetector(onTap: () => setState(() { _sel = null; _isCreating = false; }), child: const Padding(padding: EdgeInsets.all(2), child: Icon(Icons.close, color: Colors.grey, size: 16)))]), const SizedBox(height: 6),
-        Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6), decoration: BoxDecoration(color: const Color(0xFFFFD700).withOpacity(0.12), borderRadius: BorderRadius.circular(10), border: Border.all(color: const Color(0xFFFFD700).withOpacity(0.4))),
-          child: Row(children: [const Icon(Icons.monetization_on, color: Color(0xFFB8860B), size: 18), const SizedBox(width: 8), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [Text('${p.currentAmount} ₽', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900, color: Color(0xFFB8860B))), if (p.isSpoiled) const Text('🔥 Сгорает: -1 ₽/сек', style: TextStyle(fontSize: 10, color: Colors.red, fontWeight: FontWeight.w600)) else Text('⏳ Ждёт: ${_fmtDur(p.timeToSpoil)}', style: const TextStyle(fontSize: 10, color: Color(0xFF2AABEE), fontWeight: FontWeight.w600))])), Text('${p.donors.length} ${donorsWord(p.donors.length)}', style: TextStyle(fontSize: 10, color: Colors.grey.shade600))])),
-        const SizedBox(height: 8),
-        Row(children: [100, 300, 500, 1000].map((a) { final isDisabled = (_isCreating && a != 1000) || (p.isSpoiled && a != 1000); return Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 3), child: Opacity(opacity: isDisabled ? 0.3 : 1.0, child: Material(color: const Color(0xFFF0F2F5), borderRadius: BorderRadius.circular(10), child: InkWell(borderRadius: BorderRadius.circular(10), onTap: isDisabled ? null : () => setState(() => _amount.text = '$a'), child: Container(padding: const EdgeInsets.symmetric(vertical: 8), alignment: Alignment.center, child: Text('$a', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)))))))); }).toList()),
-        const SizedBox(height: 8), TextField(controller: _amount, keyboardType: TextInputType.number, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold), decoration: InputDecoration(hintText: 'Своя сумма', suffixText: '₽', prefixIcon: const Icon(Icons.edit, color: Color(0xFF2AABEE), size: 18), isDense: true, filled: true, fillColor: const Color(0xFFF0F2F5), contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10), border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none))),
-        const SizedBox(height: 6), TextField(controller: _nameController, maxLength: 20, style: const TextStyle(fontSize: 13), decoration: InputDecoration(hintText: 'Ваш ник (необязательно)', prefixIcon: const Icon(Icons.person_outline, color: Color(0xFF2AABEE), size: 18), isDense: true, filled: true, fillColor: const Color(0xFFF0F2F5), counterText: '', contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10), border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none))),
-        const SizedBox(height: 6), TextField(controller: _msg, maxLength: 100, style: const TextStyle(fontSize: 13), decoration: InputDecoration(hintText: 'Сообщение (необязательно)', prefixIcon: const Icon(Icons.chat_bubble_outline, color: Color(0xFF2AABEE), size: 18), isDense: true, filled: true, fillColor: const Color(0xFFF0F2F5), counterText: '', contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10), border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none))),
-        const SizedBox(height: 8), SizedBox(width: double.infinity, child: ElevatedButton.icon(onPressed: () => _send(p), icon: const Icon(Icons.send, size: 16), label: Text(_isCreating ? 'Создать за 1000 ₽' : (p.isSpoiled ? 'Заморозить за 1000 ₽' : 'Скинуть донат'), style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFFD700), foregroundColor: const Color(0xFF4A3200), elevation: 0, padding: const EdgeInsets.symmetric(vertical: 10), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))))),
-      ]),
+    return Container(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16)),
+      ),
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(
+            child: Container(
+              width: 30, height: 3,
+              decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2)),
+            ),
+          ),
+          const SizedBox(height: 2),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  p.title,
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              GestureDetector(
+                onTap: () => setState(() { _sel = null; _isCreating = false; }),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  child: Icon(Icons.close, color: Colors.grey, size: 16),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFFD700).withOpacity(0.12),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFFFD700).withOpacity(0.3), width: 1),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.monetization_on, color: Color(0xFFB8860B), size: 14),
+                const SizedBox(width: 4),
+                Text(
+                  '${p.currentAmount} ₽',
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w900, color: Color(0xFFB8860B)),
+                ),
+                const SizedBox(width: 6),
+                if (p.isSpoiled)
+                  const Text('🔥 -1 ₽/с', style: TextStyle(fontSize: 9, color: Colors.red, fontWeight: FontWeight.w600))
+                else
+                  Text('⏳ ${_fmtDur(p.timeToSpoil)}', style: const TextStyle(fontSize: 9, color: Color(0xFF2AABEE), fontWeight: FontWeight.w600)),
+                const Spacer(),
+                Text('${p.donors.length} дон.', style: TextStyle(fontSize: 9, color: Colors.grey.shade600)),
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [100, 300, 500, 1000].map((a) {
+              final isDisabled = (_isCreating && a != 1000) || (p.isSpoiled && a != 1000);
+              return Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 2),
+                  child: Opacity(
+                    opacity: isDisabled ? 0.3 : 1.0,
+                    child: Material(
+                      color: const Color(0xFFF0F2F5),
+                      borderRadius: BorderRadius.circular(6),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(6),
+                        onTap: isDisabled ? null : () => setState(() => _amount.text = '$a'),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          alignment: Alignment.center,
+                          child: Text('$a', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 11)),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 6),
+          TextField(
+            controller: _amount,
+            keyboardType: TextInputType.number,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+            decoration: _compactInput('Своя сумма', Icons.edit),
+          ),
+          const SizedBox(height: 4),
+          TextField(
+            controller: _nameController,
+            maxLength: 20,
+            style: const TextStyle(fontSize: 12),
+            decoration: _compactInput('Ваш ник (необязательно)', Icons.person_outline),
+          ),
+          const SizedBox(height: 4),
+          TextField(
+            controller: _msg,
+            maxLength: 100,
+            style: const TextStyle(fontSize: 12),
+            decoration: _compactInput('Сообщение (необязательно)', Icons.chat_bubble_outline),
+          ),
+          const SizedBox(height: 6),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: () => _send(p),
+              icon: const Icon(Icons.send, size: 14),
+              label: Text(
+                _isCreating ? 'Создать за 1000 ₽' : (p.isSpoiled ? 'Заморозить за 1000 ₽' : 'Скинуть донат'),
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFFFD700),
+                foregroundColor: const Color(0xFF4A3200),
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
+
+  InputDecoration _compactInput(String hint, IconData icon) {
+    return InputDecoration(
+      hintText: hint,
+      prefixIcon: Icon(icon, color: const Color(0xFF2AABEE), size: 14),
+      isDense: true,
+      filled: true,
+      fillColor: const Color(0xFFF0F2F5),
+      counterText: '',
+      contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+    );
+  }
+
   String _fmtDur(Duration d) { if (d.inHours > 0) return '${d.inHours} ч ${d.inMinutes % 60} мин'; if (d.inMinutes > 0) return '${d.inMinutes} мин'; return '${d.inSeconds} сек'; }
 
   void _send(DonationPoint p) {
     final a = int.tryParse(_amount.text.trim());
     if (a == null || a <= 0) { _snack('Введите сумму больше нуля', Colors.red); return; }
-    final isNew = _isCreating; final isBurning = p.isSpoiled;
+    final isNew = _isCreating; 
+    final isBurning = p.isSpoiled;
+    
     if (isNew && a != 1000) { _snack('Создание точки стоит 1000 ₽', Colors.red); return; }
     if (isBurning && !isNew && a != 1000) { _snack('Чтобы остановить сгорание, нужно закинуть ровно 1000 ₽', Colors.red); return; }
-    String rawName = _nameController.text.trim(); String displayName = rawName.isEmpty ? 'Аноним' : filterBadWords(rawName);
+    
+    String rawName = _nameController.text.trim(); 
+    String displayName = rawName.isEmpty ? 'Аноним' : filterBadWords(rawName);
+    final now = DateTime.now();
+    
+    final newDonation = LiveDonation(
+      donorName: displayName, 
+      pointTitle: p.title, 
+      amount: a, 
+      time: now, 
+      message: filterBadWords(_msg.text.trim()), 
+      position: p.position
+    );
+
     setState(() {
-      if (isBurning) { p.totalAmount = p.currentAmount + a; p.lastTopUp = DateTime.now(); } else { p.totalAmount += a; p.lastTopUp = DateTime.now(); }
+      // Обновляем локально
+      if (isBurning) { 
+        p.totalAmount = p.currentAmount + a; 
+      } else { 
+        p.totalAmount += a; 
+      }
+      p.lastTopUp = now;
       p.donors.add(displayName);
-      if (isNew) { points.add(p); uploadPointToCloud(widget.streamer.name, p); _isCreating = false; }
-      final newDonation = LiveDonation(donorName: displayName, pointTitle: p.title, amount: a, time: DateTime.now(), message: filterBadWords(_msg.text.trim()), position: p.position);
-      streamerFeed.putIfAbsent(widget.streamer.name, () => []); streamerFeed[widget.streamer.name]!.insert(0, newDonation); uploadDonationToCloud(widget.streamer.name, newDonation);
-      _sel = null; _amount.clear(); _msg.clear(); _nameController.clear();
+      
+      if (isNew) { 
+        points.add(p); 
+        FirebaseFirestore.instance.collection('points').add({...p.toMap(), 'streamerName': widget.streamer.name}).then((ref) {
+           setState(() => p.id = ref.id);
+           uploadDonationToCloud(widget.streamer.name, newDonation);
+        });
+        _isCreating = false; 
+      } else {
+        updatePointInCloudSafe(p, widget.streamer.name, a, now, displayName);
+        uploadDonationToCloud(widget.streamer.name, newDonation);
+      }
+      
+      streamerFeed.putIfAbsent(widget.streamer.name, () => []); 
+      streamerFeed[widget.streamer.name]!.insert(0, newDonation);
+      
+      _sel = null; 
+      _amount.clear(); 
+      _msg.clear(); 
+      _nameController.clear();
     });
     _snack(isNew ? 'Точка создана!' : (isBurning ? 'Точка заморожена!' : 'Донат $a ₽ отправлен!'), const Color(0xFF2AABEE));
   }
-
   void _newPointDialog(LatLng pos) async {
     _snack('Определяю место...', const Color(0xFF2AABEE));
     final name = await getLocationName(pos);
