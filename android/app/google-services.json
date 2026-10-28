@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "498411397127",
+    "project_id": "quest-donate",
+    "storage_bucket": "quest-donate.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:498411397127:android:28deddd3692468256c0aa2",
+        "android_client_info": {
+          "package_name": "com.example.streamer_map_donate"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDK9j3APRnGLwpf4OF5DgDTKK1p1kHe8Aw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
